@@ -24,7 +24,7 @@ protected:
 
 private:
     HICON m_hIcon;
-
+    bool m_wsaInitialized = false;
     // 카메라 2대
     CInstantCamera m_camTop;
     CInstantCamera m_camFront;

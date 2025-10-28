@@ -46,6 +46,8 @@ void CCanClientDlg::DrawMatToCtrl(const Mat& img, CWnd* pWnd)
 // ===================== TCP 전송 =====================
 bool CCanClientDlg::SendImageToServer(const std::string& imgPath)
 {
+    OutputDebugString(L"[DEBUG] SendImageToServer 시작\n");
+
     // ---- 파일 읽기 ----
     std::ifstream file(imgPath, std::ios::binary | std::ios::ate);
     if (!file) {
@@ -61,61 +63,58 @@ bool CCanClientDlg::SendImageToServer(const std::string& imgPath)
         return false;
     }
 
-    // ---- 소켓 초기화 ----
-    WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-        OutputDebugString(L"[ERROR] WSAStartup 실패\n");
-        return false;
-    }
-
+    // ---- WSAStartup/Cleanup 제거 ----
     SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock == INVALID_SOCKET) {
-        WSACleanup();
-        OutputDebugString(L"[ERROR] 소켓 생성 실패\n");
+        int err = WSAGetLastError();
+        CString errMsg;
+        errMsg.Format(L"[ERROR] 소켓 생성 실패 (WSA: %d)\n", err);
+        OutputDebugString(errMsg);
         return false;
     }
 
     sockaddr_in serverAddr = {};
     serverAddr.sin_family = AF_INET;
-    //serverAddr.sin_port = htons(9000);
-    //inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr); // 로컬 테스트용
+    //serverAddr.sin_port = htons(9999);
+    //inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
     serverAddr.sin_port = htons(9000);
-    inet_pton(AF_INET, "10.10.21.121", &serverAddr.sin_addr); // 로컬 테스트용
+    inet_pton(AF_INET, "10.10.21.121", &serverAddr.sin_addr);
 
+    OutputDebugString(L"[DEBUG] connect 시도 중...\n");
     if (connect(sock, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
-        OutputDebugString(L"[ERROR] 서버 연결 실패\n");
+        int err = WSAGetLastError();
+        CString errMsg;
+        errMsg.Format(L"[ERROR] 서버 연결 실패 (WSA: %d)\n", err);
+        OutputDebugString(errMsg);
         closesocket(sock);
-        WSACleanup();
         return false;
     }
+    OutputDebugString(L"[DEBUG] 서버 연결 성공!\n");
 
-    // ---- 1️⃣ 이미지 크기 전송 (네트워크 바이트 순서로) ----
+    // ---- 이미지 크기 전송 ----
     int fileSize = static_cast<int>(size);
-    int netSize = htonl(fileSize); // 핵심!
+    int netSize = htonl(fileSize);
+
     if (send(sock, (char*)&netSize, sizeof(netSize), 0) != sizeof(netSize)) {
         OutputDebugString(L"[ERROR] 길이 전송 실패\n");
         closesocket(sock);
-        WSACleanup();
         return false;
     }
 
-    // ---- 2️⃣ 이미지 데이터 전송 ----
+    // ---- 이미지 데이터 전송 ----
     int totalSent = 0;
     while (totalSent < fileSize) {
         int sent = send(sock, buffer.data() + totalSent, fileSize - totalSent, 0);
         if (sent <= 0) {
             OutputDebugString(L"[ERROR] 데이터 전송 실패\n");
             closesocket(sock);
-            WSACleanup();
             return false;
         }
         totalSent += sent;
     }
 
     OutputDebugString(L"[INFO] 이미지 전송 완료\n");
-
     closesocket(sock);
-    WSACleanup();
     return true;
 }
 
@@ -140,6 +139,13 @@ BOOL CCanClientDlg::OnInitDialog()
     SetIcon(m_hIcon, TRUE);
     SetIcon(m_hIcon, FALSE);
     SetDlgItemText(IDC_STATIC_STATUS, _T("카메라 연결 중..."));
+
+    // WSA 초기화 (프로그램 시작 시 한 번만)
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) == 0) {
+        m_wsaInitialized = true;
+        OutputDebugString(L"[INFO] WSA 초기화 완료\n");
+    }
 
     try {
         PylonInitialize();
@@ -210,50 +216,69 @@ void CCanClientDlg::OnTimer(UINT_PTR nIDEvent)
 void CCanClientDlg::OnBnClickedBtnStart()
 {
     GetDlgItem(IDC_BTN_START)->EnableWindow(FALSE);
+
+    // 타이머 중지 (카메라 접근 충돌 방지)
+    if (m_timerId) {
+        KillTimer(m_timerId);
+    }
+
     SetDlgItemText(IDC_STATIC_STATUS, _T("이미지 캡처 중..."));
 
     try {
         CString folder = L"C:\\CanClient\\captures";
         CreateDirectory(folder, NULL);
 
-        if (!m_camTop.IsOpen()) m_camTop.Open();
-        if (!m_camFront.IsOpen()) m_camFront.Open();
-
-        if (!m_camTop.IsGrabbing())
-            m_camTop.StartGrabbing(GrabStrategy_LatestImageOnly);
-        if (!m_camFront.IsGrabbing())
-            m_camFront.StartGrabbing(GrabStrategy_LatestImageOnly);
-
-        Sleep(100);
+        Sleep(100); // 카메라 안정화
 
         CGrabResultPtr grabTop, grabFront;
 
         // ---- 상단 ----
-        if (m_camTop.RetrieveResult(800, grabTop, TimeoutHandling_Return) && grabTop->GrabSucceeded()) {
-            m_converter.OutputPixelFormat = PixelType_BGR8packed;
+        if (m_camTop.RetrieveResult(1000, grabTop, TimeoutHandling_Return) && grabTop->GrabSucceeded()) {
+            // 로컬 컨버터 사용 (공유 리소스 충돌 방지)
+            CImageFormatConverter converter;
+            converter.OutputPixelFormat = PixelType_BGR8packed;
             CPylonImage imgTop;
-            m_converter.Convert(imgTop, grabTop);
+            converter.Convert(imgTop, grabTop);
             Mat topMat((int)grabTop->GetHeight(), (int)grabTop->GetWidth(), CV_8UC3, (void*)imgTop.GetBuffer());
 
             std::string topPath = "C:\\CanClient\\captures\\capture_" +
                 std::to_string(time(NULL)) + "_top.jpg";
 
-            if (imwrite(topPath, topMat))
-                SendImageToServer(topPath);
+            if (imwrite(topPath, topMat)) {
+                OutputDebugString(L"[INFO] Top 이미지 저장 완료\n");
+                bool success = SendImageToServer(topPath);
+                if (success) {
+                    OutputDebugString(L"[INFO] Top 이미지 전송 완료\n");
+                }
+                else {
+                    OutputDebugString(L"[ERROR] Top 이미지 전송 실패\n");
+                }
+            }
         }
 
+        Sleep(100); // 약간의 딜레이
+
         // ---- 정면 ----
-        if (m_camFront.RetrieveResult(800, grabFront, TimeoutHandling_Return) && grabFront->GrabSucceeded()) {
-            m_converter.OutputPixelFormat = PixelType_BGR8packed;
+        if (m_camFront.RetrieveResult(1000, grabFront, TimeoutHandling_Return) && grabFront->GrabSucceeded()) {
+            CImageFormatConverter converter;
+            converter.OutputPixelFormat = PixelType_BGR8packed;
             CPylonImage imgFront;
-            m_converter.Convert(imgFront, grabFront);
+            converter.Convert(imgFront, grabFront);
             Mat frontMat((int)grabFront->GetHeight(), (int)grabFront->GetWidth(), CV_8UC3, (void*)imgFront.GetBuffer());
 
             std::string frontPath = "C:\\CanClient\\captures\\capture_" +
                 std::to_string(time(NULL)) + "_front.jpg";
 
-            if (imwrite(frontPath, frontMat))
-                SendImageToServer(frontPath);
+            if (imwrite(frontPath, frontMat)) {
+                OutputDebugString(L"[INFO] Front 이미지 저장 완료\n");
+                bool success = SendImageToServer(frontPath);
+                if (success) {
+                    OutputDebugString(L"[INFO] Front 이미지 전송 완료\n");
+                }
+                else {
+                    OutputDebugString(L"[ERROR] Front 이미지 전송 실패\n");
+                }
+            }
         }
 
         SetDlgItemText(IDC_STATIC_STATUS, _T("상단/정면 촬영 및 전송 완료 ✅"));
@@ -263,6 +288,8 @@ void CCanClientDlg::OnBnClickedBtnStart()
         AfxMessageBox(msg);
     }
 
+    // 타이머 재시작
+    m_timerId = SetTimer(1, 33, nullptr);
     GetDlgItem(IDC_BTN_START)->EnableWindow(TRUE);
 }
 
@@ -280,4 +307,10 @@ void CCanClientDlg::OnDestroy()
         PylonTerminate();
     }
     catch (...) {}
+
+    // WSA 정리
+    if (m_wsaInitialized) {
+        WSACleanup();
+        m_wsaInitialized = false;
+    }
 }
