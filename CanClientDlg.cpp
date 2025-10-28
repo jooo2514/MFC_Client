@@ -119,12 +119,10 @@ BOOL CCanClientDlg::OnInitDialog()
     return TRUE;
 }
 
-// ===================== 버튼: 시작/정지 =====================
 void CCanClientDlg::OnBnClickedBtnStart()
 {
     if (g_camera.IsGrabbing())
     {
-        // ======= 카메라 정지 =======
         try { g_camera.StopGrabbing(); }
         catch (...) {}
         try { if (g_camera.IsOpen()) g_camera.Close(); }
@@ -136,60 +134,54 @@ void CCanClientDlg::OnBnClickedBtnStart()
         return;
     }
 
-    // ======= 카메라 시작 =======
-    try {
+    try
+    {
         PylonInitialize();
         g_camera.Attach(CTlFactory::GetInstance().CreateFirstDevice());
         g_camera.Open();
 
         INodeMap& nm = g_camera.GetNodeMap();
 
-        // ---------- 1. 기본 포맷 설정 ----------
-        if (CEnumerationPtr pf = nm.GetNode("PixelFormat"); IsWritable(pf))
-            pf->FromString("Mono8");
+        // --- 자동 노출 / 게인 ---
+        CEnumerationPtr exposureAuto(nm.GetNode("ExposureAuto"));
+        if (IsWritable(exposureAuto)) exposureAuto->FromString("Continuous");
 
-        // ---------- 2. 자동 모드 OFF ----------
-        if (CEnumerationPtr eauto = nm.GetNode("ExposureAuto"); IsWritable(eauto))
-            eauto->FromString("Off");
-        if (CEnumerationPtr gauto = nm.GetNode("GainAuto"); IsWritable(gauto))
-            gauto->FromString("Off");
+        CEnumerationPtr gainAuto(nm.GetNode("GainAuto"));
+        if (IsWritable(gainAuto)) gainAuto->FromString("Continuous");
 
-        // ---------- 3. 노출 / 게인 / 감마 수동 설정 ----------
-        if (CFloatPtr exp = nm.GetNode("ExposureTime"); IsWritable(exp))
-            exp->SetValue(150000.0); // 120,000 µs = 0.12초 (실내 밝기 기준)
-        if (CFloatPtr gain = nm.GetNode("Gain"); IsWritable(gain))
-            gain->SetValue(8.0); // 밝기 보정
-        if (CFloatPtr gamma = nm.GetNode("Gamma"); IsWritable(gamma))
-            gamma->SetValue(1.4); // 명암 보정
+        CFloatPtr exposureUpper(nm.GetNode("AutoExposureTimeUpperLimit"));
+        if (IsWritable(exposureUpper)) exposureUpper->SetValue(70000.0); // 70ms 최대
 
-        // ---------- 4. LUT (밝기 보정) ----------
-        if (CBooleanPtr lutEnable = nm.GetNode("LUTEnable"); IsWritable(lutEnable))
-            lutEnable->SetValue(true);
+        // --- 감마 설정 ---
+        CFloatPtr gamma(nm.GetNode("Gamma"));
+        if (IsWritable(gamma)) gamma->SetValue(0.9);
 
-        // ---------- 5. PGI (노이즈 감소 + 샤프닝) ----------
-        if (CEnumerationPtr pgiMode = nm.GetNode("PgiMode"); IsWritable(pgiMode))
-            pgiMode->FromString("On");
+        // --- PGI(노이즈 감소 + 샤프니스) 활성화 ---
+        CEnumerationPtr pgiMode(nm.GetNode("PgiMode"));
+        if (IsWritable(pgiMode)) pgiMode->FromString("On");
 
-        // ---------- 6. 해상도 최대값 ----------
-        if (CIntegerPtr w = nm.GetNode("Width"); IsWritable(w)) w->SetValue(w->GetMax());
-        if (CIntegerPtr h = nm.GetNode("Height"); IsWritable(h)) h->SetValue(h->GetMax());
+        CFloatPtr noiseReduction(nm.GetNode("NoiseReduction"));
+        if (IsWritable(noiseReduction)) noiseReduction->SetValue(1.5); // 0~1 (값 높을수록 부드럽게)
 
-        // ---------- 7. 출력 픽셀 포맷 변환기 ----------
+        CFloatPtr sharpnessEnhancement(nm.GetNode("SharpnessEnhancement"));
+        if (IsWritable(sharpnessEnhancement)) sharpnessEnhancement->SetValue(1.0); // 1.0 ~ 3.0 권장 (선명하게)
+
+        // --- 픽셀 포맷 고정 ---
+        CEnumerationPtr pixelFormat(nm.GetNode("PixelFormat"));
+        if (IsWritable(pixelFormat)) pixelFormat->FromString("Mono8");
+
+        // --- 변환기 설정 ---
         g_conv.OutputPixelFormat = PixelType_Mono8;
 
-        // ---------- 8. 프레임 수신 시작 ----------
+        // --- Grab 시작 ---
         g_camera.StartGrabbing(GrabStrategy_LatestImageOnly);
-        g_timerId = SetTimer(1, 33, nullptr); // 약 30fps
-
+        g_timerId = SetTimer(1, 33, nullptr);
         SetDlgItemText(IDC_STATIC_STATUS, _T("Basler 카메라 실행 중... (다시 클릭 시 정지)"));
-        OutputDebugString(L"[Basler] Camera started successfully.\n");
     }
     catch (const GenericException& e)
     {
         CString msg(e.GetDescription());
         AfxMessageBox(msg);
-
-        // 안전 종료
         try { if (g_camera.IsGrabbing()) g_camera.StopGrabbing(); }
         catch (...) {}
         try { if (g_camera.IsOpen()) g_camera.Close(); }
@@ -197,10 +189,11 @@ void CCanClientDlg::OnBnClickedBtnStart()
         try { PylonTerminate(); }
         catch (...) {}
         if (g_timerId) { KillTimer(g_timerId); g_timerId = 0; }
-
-        SetDlgItemText(IDC_STATIC_STATUS, _T("카메라 초기화 실패"));
     }
 }
+
+
+
 
 
 // ===================== OnTimer: 프레임 수신/표시 =====================
@@ -214,7 +207,6 @@ void CCanClientDlg::OnTimer(UINT_PTR nIDEvent)
             {
                 if (g_grab->GrabSucceeded())
                 {
-                    // ====== Basler → OpenCV Mat 변환 ======
                     g_conv.Convert(g_pimg, g_grab);
                     cv::Mat gray(
                         (int)g_grab->GetHeight(),
@@ -223,40 +215,20 @@ void CCanClientDlg::OnTimer(UINT_PTR nIDEvent)
                         (void*)g_pimg.GetBuffer()
                     );
 
-                    // ====== 밝기/감마 보정 ======
-                    cv::Mat bright;
-                    gray.convertTo(bright, CV_8U, 1.2, 10); // 대비↑, 밝기↑
-
-                    // 감마 보정 (감마 < 1 → 밝게, >1 → 어둡게)
-                    cv::Mat gammaCorrected;
-                    bright.convertTo(bright, CV_32F, 1.0 / 255.0);
-                    cv::pow(bright, 0.8, gammaCorrected); // 감마 0.8로 약간 밝게
-                    gammaCorrected.convertTo(gammaCorrected, CV_8U, 255.0);
-
-                    // ====== 부드럽게 (노이즈 완화) ======
-                    cv::Mat smooth;
-                    cv::bilateralFilter(gammaCorrected, smooth, 5, 50, 50);
-
-                    // ====== BGR 변환 후 표시 ======
+                    // ----- 후처리 제거: 원본 그대로 표시 -----
                     cv::Mat bgr;
-                    cv::cvtColor(smooth, bgr, cv::COLOR_GRAY2BGR);
+                    cv::cvtColor(gray, bgr, cv::COLOR_GRAY2BGR);
                     DrawMatToCtrl(bgr, GetDlgItem(IDC_CAM_VIEW));
-                }
-                else
-                {
-                    OutputDebugString(L"[Basler] Grab failed\n");
                 }
             }
         }
-        catch (const GenericException& e)
-        {
-            CString msg(e.GetDescription());
-            OutputDebugString(msg + L"\n");
-        }
+        catch (...) {}
     }
 
     CDialogEx::OnTimer(nIDEvent);
 }
+
+
 
 
 
