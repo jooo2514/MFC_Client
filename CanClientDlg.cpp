@@ -7,6 +7,14 @@
 #include <pylon/PylonIncludes.h>
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <vector>
+#include <ShlObj.h>  // SHCreateDirectoryEx 사용
+#pragma comment(lib, "Shell32.lib")
+
+#pragma comment(lib, "ws2_32.lib")
 
 using namespace Pylon;
 using namespace GenApi;
@@ -16,15 +24,15 @@ using namespace cv;
 #define new DEBUG_NEW
 #endif
 
-// ===================== 전역(translation unit local) =====================
+// ===================== 전역 =====================
 namespace {
-    CInstantCamera      g_camera;
-    CGrabResultPtr      g_grab;
+    CInstantCamera g_camera;
+    CGrabResultPtr g_grab;
     CImageFormatConverter g_conv;
-    CPylonImage         g_pimg;
-    UINT_PTR            g_timerId = 0;
+    CPylonImage g_pimg;
+    UINT_PTR g_timerId = 0;
 
-    // Mat을 Picture Control(IDC_CAM_VIEW)에 그리기 (24bpp BGR)
+    // Mat을 Picture Control에 출력
     void DrawMatToCtrl(const Mat& bgr, CWnd* pCtrl)
     {
         if (!pCtrl || bgr.empty()) return;
@@ -34,7 +42,7 @@ namespace {
         BITMAPINFO bmi = {};
         bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
         bmi.bmiHeader.biWidth = bgr.cols;
-        bmi.bmiHeader.biHeight = -bgr.rows; // 상단부터
+        bmi.bmiHeader.biHeight = -bgr.rows;
         bmi.bmiHeader.biPlanes = 1;
         bmi.bmiHeader.biBitCount = 24;
         bmi.bmiHeader.biCompression = BI_RGB;
@@ -46,46 +54,95 @@ namespace {
             bgr.data, &bmi, DIB_RGB_COLORS, SRCCOPY);
     }
 
-    // 카메라 기본 설정(pylon 5.x 호환: GenApi 노드 접근)
+    // Basler 카메라 초기 설정
     void ApplyCameraConfig(INodeMap& nm)
     {
-        // PixelFormat = Mono8 (흑백 센서)
         if (CEnumerationPtr pf = nm.GetNode("PixelFormat"); IsWritable(pf))
             pf->FromString("Mono8");
 
-        // 자동노출/게인 OFF
         if (CEnumerationPtr eauto = nm.GetNode("ExposureAuto"); IsWritable(eauto))
             eauto->FromString("Off");
         if (CEnumerationPtr gauto = nm.GetNode("GainAuto"); IsWritable(gauto))
             gauto->FromString("Off");
 
-        // 노출/게인/감마(실내 기준 안전값)
         if (CFloatPtr exp = nm.GetNode("ExposureTime"); IsWritable(exp))
-            exp->SetValue(80000.0); // 80ms
+            exp->SetValue(15000.0);
         if (CFloatPtr gain = nm.GetNode("Gain"); IsWritable(gain))
-            gain->SetValue(6.0);    // 6 dB
+            gain->SetValue(2.0);
         if (CFloatPtr gamma = nm.GetNode("Gamma"); IsWritable(gamma))
-            gamma->SetValue(1.1);
+            gamma->SetValue(1.0);
 
-        // 해상도 최대
-        if (CIntegerPtr w = nm.GetNode("Width"); IsWritable(w))   w->SetValue(w->GetMax());
-        if (CIntegerPtr h = nm.GetNode("Height"); IsWritable(h))  h->SetValue(h->GetMax());
+        if (CIntegerPtr w = nm.GetNode("Width"); IsWritable(w))
+            w->SetValue(1952);
+        if (CIntegerPtr h = nm.GetNode("Height"); IsWritable(h))
+            h->SetValue(1232);
     }
 
-    // pylon Viewer의 UserSet을 불러오되(가능하면), 없으면 수동설정
-    void LoadUserSetOrFallback(INodeMap& nm)
+    // TCP로 이미지 파일 전송
+    bool SendImageToServer(const std::string& filePath, const std::string& serverIp, int port)
     {
+        WSADATA wsa;
+        SOCKET sock = INVALID_SOCKET;
+        FILE* fp = nullptr;
+
         try {
-            CEnumerationPtr sel = nm.GetNode("UserSetSelector");
-            CCommandPtr     load = nm.GetNode("UserSetLoad");
-            if (IsWritable(sel))  sel->FromString("AutoFunctions"); // 뷰어 덤프에 있었던 값
-            if (IsWritable(load)) load->Execute();
-            OutputDebugString(L"[Basler] UserSet AutoFunctions loaded\n");
+            if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
+                throw std::runtime_error("WSAStartup 실패");
+
+            sock = socket(AF_INET, SOCK_STREAM, 0);
+            if (sock == INVALID_SOCKET)
+                throw std::runtime_error("소켓 생성 실패");
+
+            sockaddr_in server = {};
+            server.sin_family = AF_INET;
+            server.sin_port = htons(port);
+            inet_pton(AF_INET, serverIp.c_str(), &server.sin_addr);
+
+            if (connect(sock, (sockaddr*)&server, sizeof(server)) < 0)
+                throw std::runtime_error("서버 연결 실패");
+
+            if (fopen_s(&fp, filePath.c_str(), "rb") != 0 || !fp)
+                throw std::runtime_error("파일 열기 실패");
+
+            fseek(fp, 0, SEEK_END);
+            long fileSize = ftell(fp);
+            fseek(fp, 0, SEEK_SET);
+
+            // 파일 크기 전송
+            send(sock, (char*)&fileSize, sizeof(fileSize), 0);
+
+            // 파일 데이터 전송
+            std::vector<char> buffer(4096);
+            while (!feof(fp))
+            {
+                size_t bytes = fread(buffer.data(), 1, buffer.size(), fp);
+                if (bytes > 0) send(sock, buffer.data(), (int)bytes, 0);
+            }
+
+            fclose(fp);
+            fp = nullptr;
+
+            // 서버 응답 수신
+            char recvBuf[256] = { 0 };
+            int len = recv(sock, recvBuf, sizeof(recvBuf) - 1, 0);
+            if (len > 0)
+            {
+                recvBuf[len] = 0;
+                CString msg(recvBuf);
+                AfxMessageBox(msg);
+            }
         }
-        catch (...) {
-            OutputDebugString(L"[Basler] UserSet not available -> apply manual config\n");
-            ApplyCameraConfig(nm);
+        catch (const std::exception& e) {
+            AfxMessageBox(CString("전송 실패: ") + CString(e.what()));
+            if (fp) fclose(fp);
+            if (sock != INVALID_SOCKET) closesocket(sock);
+            WSACleanup();
+            return false;
         }
+
+        if (sock != INVALID_SOCKET) closesocket(sock);
+        WSACleanup();
+        return true;
     }
 }
 
@@ -109,7 +166,6 @@ BEGIN_MESSAGE_MAP(CCanClientDlg, CDialogEx)
     ON_BN_CLICKED(IDC_BTN_START, &CCanClientDlg::OnBnClickedBtnStart)
 END_MESSAGE_MAP()
 
-// ===================== OnInitDialog =====================
 BOOL CCanClientDlg::OnInitDialog()
 {
     CDialogEx::OnInitDialog();
@@ -119,105 +175,85 @@ BOOL CCanClientDlg::OnInitDialog()
     return TRUE;
 }
 
+// ===================== 버튼: 시작/정지 + 촬영/전송 =====================
 void CCanClientDlg::OnBnClickedBtnStart()
 {
-    if (g_camera.IsGrabbing())
+    if (!g_camera.IsOpen())
     {
-        try { g_camera.StopGrabbing(); }
-        catch (...) {}
-        try { if (g_camera.IsOpen()) g_camera.Close(); }
-        catch (...) {}
-        try { PylonTerminate(); }
-        catch (...) {}
-        if (g_timerId) { KillTimer(g_timerId); g_timerId = 0; }
-        SetDlgItemText(IDC_STATIC_STATUS, _T("카메라 정지됨"));
+        // ---- 카메라 시작 ----
+        try {
+            PylonInitialize();
+            g_camera.Attach(CTlFactory::GetInstance().CreateFirstDevice());
+            g_camera.Open();
+            ApplyCameraConfig(g_camera.GetNodeMap());
+
+            g_conv.OutputPixelFormat = PixelType_Mono8;
+            g_camera.StartGrabbing(GrabStrategy_LatestImageOnly);
+
+            g_timerId = SetTimer(1, 33, nullptr);
+            SetDlgItemText(IDC_STATIC_STATUS, _T("카메라 실행 중... (다시 클릭 시 촬영)"));
+        }
+        catch (const GenericException& e) {
+            CString msg(e.GetDescription());
+            AfxMessageBox(msg);
+        }
         return;
     }
 
-    try
+    // ---- 현재 프레임 캡처 & 서버 전송 ----
+    if (g_camera.IsGrabbing())
     {
-        PylonInitialize();
-        g_camera.Attach(CTlFactory::GetInstance().CreateFirstDevice());
-        g_camera.Open();
+        if (g_camera.RetrieveResult(500, g_grab, TimeoutHandling_Return) && g_grab->GrabSucceeded())
+        {
+            g_conv.Convert(g_pimg, g_grab);
 
-        INodeMap& nm = g_camera.GetNodeMap();
+            Mat frame((int)g_grab->GetHeight(), (int)g_grab->GetWidth(), CV_8UC1, (void*)g_pimg.GetBuffer());
+            Mat bgr; cvtColor(frame, bgr, COLOR_GRAY2BGR);
 
-        // --- 자동 노출 / 게인 ---
-        CEnumerationPtr exposureAuto(nm.GetNode("ExposureAuto"));
-        if (IsWritable(exposureAuto)) exposureAuto->FromString("Continuous");
+            // JPG 저장
+            CString dir = _T("C:\\CanClient\\captures");
+            SHCreateDirectoryEx(NULL, dir, NULL);
 
-        CEnumerationPtr gainAuto(nm.GetNode("GainAuto"));
-        if (IsWritable(gainAuto)) gainAuto->FromString("Continuous");
+            CString filename;
+            CTime now = CTime::GetCurrentTime();
+            filename.Format(_T("%s\\capture_%04d%02d%02d_%02d%02d%02d.jpg"),
+                dir, now.GetYear(), now.GetMonth(), now.GetDay(),
+                now.GetHour(), now.GetMinute(), now.GetSecond());
 
-        CFloatPtr exposureUpper(nm.GetNode("AutoExposureTimeUpperLimit"));
-        if (IsWritable(exposureUpper)) exposureUpper->SetValue(70000.0); // 70ms 최대
+            // UTF-8 변환
+            CT2A utf8File(filename, CP_UTF8);
+            std::string path(utf8File.m_psz);
 
-        // --- 감마 설정 ---
-        CFloatPtr gamma(nm.GetNode("Gamma"));
-        if (IsWritable(gamma)) gamma->SetValue(0.9);
+            if (!cv::imwrite(path, bgr)) {
+                AfxMessageBox(_T("이미지 저장 실패"));
+                return;
+            }
 
-        // --- PGI(노이즈 감소 + 샤프니스) 활성화 ---
-        CEnumerationPtr pgiMode(nm.GetNode("PgiMode"));
-        if (IsWritable(pgiMode)) pgiMode->FromString("On");
-
-        CFloatPtr noiseReduction(nm.GetNode("NoiseReduction"));
-        if (IsWritable(noiseReduction)) noiseReduction->SetValue(1.5); // 0~1 (값 높을수록 부드럽게)
-
-        CFloatPtr sharpnessEnhancement(nm.GetNode("SharpnessEnhancement"));
-        if (IsWritable(sharpnessEnhancement)) sharpnessEnhancement->SetValue(1.0); // 1.0 ~ 3.0 권장 (선명하게)
-
-        // --- 픽셀 포맷 고정 ---
-        CEnumerationPtr pixelFormat(nm.GetNode("PixelFormat"));
-        if (IsWritable(pixelFormat)) pixelFormat->FromString("Mono8");
-
-        // --- 변환기 설정 ---
-        g_conv.OutputPixelFormat = PixelType_Mono8;
-
-        // --- Grab 시작 ---
-        g_camera.StartGrabbing(GrabStrategy_LatestImageOnly);
-        g_timerId = SetTimer(1, 33, nullptr);
-        SetDlgItemText(IDC_STATIC_STATUS, _T("Basler 카메라 실행 중... (다시 클릭 시 정지)"));
-    }
-    catch (const GenericException& e)
-    {
-        CString msg(e.GetDescription());
-        AfxMessageBox(msg);
-        try { if (g_camera.IsGrabbing()) g_camera.StopGrabbing(); }
-        catch (...) {}
-        try { if (g_camera.IsOpen()) g_camera.Close(); }
-        catch (...) {}
-        try { PylonTerminate(); }
-        catch (...) {}
-        if (g_timerId) { KillTimer(g_timerId); g_timerId = 0; }
+            // 서버 전송
+            SetDlgItemText(IDC_STATIC_STATUS, _T("서버로 이미지 전송 중..."));
+            bool ok = SendImageToServer(path, "127.0.0.1", 9000);
+            if (ok)
+                SetDlgItemText(IDC_STATIC_STATUS, _T("서버 전송 완료 ✅"));
+            else
+                SetDlgItemText(IDC_STATIC_STATUS, _T("전송 실패 ❌"));
+        }
     }
 }
 
-
-
-
-
-// ===================== OnTimer: 프레임 수신/표시 =====================
+// ===================== OnTimer: 프레임 표시 =====================
 void CCanClientDlg::OnTimer(UINT_PTR nIDEvent)
 {
     if (nIDEvent == 1 && g_camera.IsGrabbing())
     {
         try
         {
-            if (g_camera.RetrieveResult(500, g_grab, TimeoutHandling_Return))
+            if (g_camera.RetrieveResult(100, g_grab, TimeoutHandling_Return))
             {
                 if (g_grab->GrabSucceeded())
                 {
                     g_conv.Convert(g_pimg, g_grab);
-                    cv::Mat gray(
-                        (int)g_grab->GetHeight(),
-                        (int)g_grab->GetWidth(),
-                        CV_8UC1,
-                        (void*)g_pimg.GetBuffer()
-                    );
-
-                    // ----- 후처리 제거: 원본 그대로 표시 -----
-                    cv::Mat bgr;
-                    cv::cvtColor(gray, bgr, cv::COLOR_GRAY2BGR);
+                    Mat gray((int)g_grab->GetHeight(), (int)g_grab->GetWidth(), CV_8UC1, (void*)g_pimg.GetBuffer());
+                    Mat bgr; cvtColor(gray, bgr, COLOR_GRAY2BGR);
                     DrawMatToCtrl(bgr, GetDlgItem(IDC_CAM_VIEW));
                 }
             }
@@ -228,10 +264,6 @@ void CCanClientDlg::OnTimer(UINT_PTR nIDEvent)
     CDialogEx::OnTimer(nIDEvent);
 }
 
-
-
-
-
 // ===================== 종료 처리 =====================
 void CCanClientDlg::OnDestroy()
 {
@@ -239,13 +271,13 @@ void CCanClientDlg::OnDestroy()
     if (g_timerId) { KillTimer(g_timerId); g_timerId = 0; }
     try { if (g_camera.IsGrabbing()) g_camera.StopGrabbing(); }
     catch (...) {}
-    try { if (g_camera.IsOpen())     g_camera.Close(); }
+    try { if (g_camera.IsOpen()) g_camera.Close(); }
     catch (...) {}
     try { PylonTerminate(); }
     catch (...) {}
 }
 
-// ===================== OnPaint / OnQueryDragIcon =====================
+// ===================== 기본 윈도우 처리 =====================
 void CCanClientDlg::OnPaint()
 {
     if (IsIconic())
@@ -259,10 +291,7 @@ void CCanClientDlg::OnPaint()
         const int y = (rc.Height() - cy + 1) / 2;
         dc.DrawIcon(x, y, m_hIcon);
     }
-    else
-    {
-        CDialogEx::OnPaint();
-    }
+    else CDialogEx::OnPaint();
 }
 
 HCURSOR CCanClientDlg::OnQueryDragIcon()
