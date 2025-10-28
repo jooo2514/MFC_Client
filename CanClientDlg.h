@@ -16,29 +16,26 @@ public:
 
 protected:
     virtual void DoDataExchange(CDataExchange* pDX);
-
-protected:
-    HICON m_hIcon;
-    DECLARE_MESSAGE_MAP()
-
-protected:
-    afx_msg BOOL OnInitDialog();
-    afx_msg void OnPaint();
-    afx_msg HCURSOR OnQueryDragIcon();
+    virtual BOOL OnInitDialog();
+    afx_msg void OnDestroy();
     afx_msg void OnBnClickedBtnStart();
     afx_msg void OnTimer(UINT_PTR nIDEvent);
-    afx_msg void OnDestroy();
+    DECLARE_MESSAGE_MAP()
 
 private:
-    // ---- Basler 관련 멤버 ----
-    CInstantCamera m_camera;
-    CGrabResultPtr m_ptrGrabResult;
+    HICON m_hIcon;
+
+    // 카메라 2대
+    CInstantCamera m_camTop;
+    CInstantCamera m_camFront;
+
+    // 변환기/결과 이미지
     CImageFormatConverter m_converter;
     CPylonImage m_pylonImage;
 
-    // ---- OpenCV ----
-    cv::Mat m_frame;
+    UINT_PTR m_timerId = 0;
 
-    UINT_PTR m_timerID = 0;
-    bool m_isCameraRunning = false;
+    // 헬퍼 함수
+    void DrawMatToCtrl(const cv::Mat& img, CWnd* pWnd);
+    bool SendImageToServer(const std::string& imgPath);
 };
