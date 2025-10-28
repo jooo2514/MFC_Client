@@ -1,26 +1,26 @@
 ﻿#pragma once
+#include <pylon/PylonIncludes.h>
+#include <opencv2/opencv.hpp>
 
-#include <opencv2/opencv.hpp>  // OpenCV 헤더 포함
+using namespace Pylon;
+using namespace cv;
 
-// CCanClientDlg 대화 상자
 class CCanClientDlg : public CDialogEx
 {
 public:
-    CCanClientDlg(CWnd* pParent = nullptr); // 생성자
+    CCanClientDlg(CWnd* pParent = nullptr);
 
 #ifdef AFX_DESIGN_TIME
     enum { IDD = IDD_CANCLIENT_DIALOG };
 #endif
 
 protected:
-    virtual void DoDataExchange(CDataExchange* pDX); // DDX/DDV 지원
+    virtual void DoDataExchange(CDataExchange* pDX);
 
-    // 구현
 protected:
-    HICON m_hIcon;  // ✅ 아이콘 핸들 (기본 MFC 코드에서 빠졌던 부분)
+    HICON m_hIcon;
     DECLARE_MESSAGE_MAP()
 
-    // 사용자 함수
 protected:
     afx_msg BOOL OnInitDialog();
     afx_msg void OnPaint();
@@ -30,7 +30,15 @@ protected:
     afx_msg void OnDestroy();
 
 private:
-    cv::VideoCapture cap; // 카메라 객체
-    cv::Mat frame;        // 영상 프레임
-    UINT_PTR timerID = 0; // 타이머 ID
+    // ---- Basler 관련 멤버 ----
+    CInstantCamera m_camera;
+    CGrabResultPtr m_ptrGrabResult;
+    CImageFormatConverter m_converter;
+    CPylonImage m_pylonImage;
+
+    // ---- OpenCV ----
+    cv::Mat m_frame;
+
+    UINT_PTR m_timerID = 0;
+    bool m_isCameraRunning = false;
 };
