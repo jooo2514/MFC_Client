@@ -9,6 +9,10 @@
 #include <ws2tcpip.h>
 #pragma comment(lib, "ws2_32.lib")
 
+// ===== JSON 라이브러리 추가 =====
+#include <nlohmann/json.hpp>
+using json = nlohmann::json;
+
 #ifdef _DEBUG
 #define new DEBUG_NEW
 #endif
@@ -250,9 +254,11 @@ void CCanClientDlg::OnBnClickedBtnStart()
                     OutputDebugString(L"[SUCCESS] 검사 완료 및 결과 표시\n");
                 }
                 else {
-                    // JSON 파싱 실패 시 간단 처리
-                    result.defectType = CString(frontResponse.c_str());
-                    result.defectDetail = _T("");
+                    // JSON 파싱 실패 → 원본 문자열 그대로 표시
+                    OutputDebugStringA(("[WARNING] JSON 파싱 실패, 원본: " + frontResponse + "\n").c_str());
+
+                    result.defectType = _T("에러");
+                    result.defectDetail = CString(frontResponse.c_str());
 
                     UpdateCurrentResult(result);
                     AddToHistory(result);
@@ -302,8 +308,8 @@ bool CCanClientDlg::SendImageToServer(const std::string& imgPath, std::string& r
     // ===== 서버 연결 =====
     sockaddr_in serverAddr = {};
     serverAddr.sin_family = AF_INET;
-    //serverAddr.sin_port = htons(9000);
-    //inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
+    serverAddr.sin_port = htons(9000);
+    inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
 
     serverAddr.sin_port = htons(9000);
     inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
@@ -360,37 +366,71 @@ bool CCanClientDlg::SendImageToServer(const std::string& imgPath, std::string& r
 }
 
 // ===================== JSON 파싱 (간단 버전) =====================
-bool CCanClientDlg::ParseJsonResponse(const std::string& json, InspectionResult& result)
+bool CCanClientDlg::ParseJsonResponse(const std::string& jsonStr, InspectionResult& result)
 {
-    if (json.empty()) return false;
+    if (jsonStr.empty()) {
+        OutputDebugString(L"[ERROR] JSON 문자열이 비어있음\n");
+        return false;
+    }
 
-    // ===== result 필드 찾기 =====
-    // 예: {"result":"정상","reason":"찌그러짐","timestamp":"2025-10-29 14:30:00"}
+    try {
+        // ===== JSON 파싱 =====
+        auto j = json::parse(jsonStr);
 
-    std::string key = "\"result\":\"";
-    size_t pos = json.find(key);
-    if (pos != std::string::npos) {
-        size_t start = pos + key.length();
-        size_t end = json.find("\"", start);
-        if (end != std::string::npos) {
-            std::string resultStr = json.substr(start, end - start);
+        // ===== result 필드 (필수) =====
+        if (j.contains("result")) {
+            std::string resultStr = j["result"].get<std::string>();
             result.defectType = CString(resultStr.c_str());
-        }
-    }
 
-    // ===== reason 필드 찾기 =====
-    key = "\"reason\":\"";
-    pos = json.find(key);
-    if (pos != std::string::npos) {
-        size_t start = pos + key.length();
-        size_t end = json.find("\"", start);
-        if (end != std::string::npos) {
-            std::string reasonStr = json.substr(start, end - start);
+            CStringA log;
+            log.Format("[JSON] result = %s\n", resultStr.c_str());
+            OutputDebugStringA(log);
+        }
+        else {
+            OutputDebugString(L"[ERROR] JSON에 'result' 필드 없음\n");
+            return false;
+        }
+
+        // ===== reason 필드 (선택) =====
+        if (j.contains("reason")) {
+            std::string reasonStr = j["reason"].get<std::string>();
             result.defectDetail = CString(reasonStr.c_str());
-        }
-    }
 
-    return !result.defectType.IsEmpty();
+            CStringA log;
+            log.Format("[JSON] reason = %s\n", reasonStr.c_str());
+            OutputDebugStringA(log);
+        }
+        else {
+            result.defectDetail = _T("");
+        }
+
+        // ===== timestamp 필드 (선택) =====
+        if (j.contains("timestamp")) {
+            std::string timestampStr = j["timestamp"].get<std::string>();
+            // 서버에서 보낸 timestamp 사용 (선택사항)
+            // result.timestamp = CString(timestampStr.c_str());
+        }
+
+        return true;
+    }
+    catch (json::parse_error& e) {
+        CStringA errMsg;
+        errMsg.Format("[ERROR] JSON 파싱 실패: %s\n", e.what());
+        OutputDebugStringA(errMsg);
+        return false;
+    }
+    catch (json::type_error& e) {
+        CStringA errMsg;
+        errMsg.Format("[ERROR] JSON 타입 에러: %s\n", e.what());
+        OutputDebugStringA(errMsg);
+        return false;
+    }
+    catch (std::exception& e) {
+        CStringA errMsg;
+        errMsg.Format("[ERROR] JSON 예외: %s\n", e.what());
+        OutputDebugStringA(errMsg);
+        return false;
+    }
 }
 
 // ===================== UI 업데이트 =====================
@@ -407,6 +447,7 @@ void CCanClientDlg::UpdateCurrentResult(const InspectionResult& result)
     }
 }
 
+// ===================== 현재 결과 초기화 =====================
 void CCanClientDlg::ClearCurrentResult()
 {
     SetDlgItemText(IDC_STATIC_PRODUCT_ID, _T("-"));
@@ -468,6 +509,7 @@ void CCanClientDlg::SaveHistoryToFile()
     file.Close();
 }
 
+// ================= 히스토리 파일에서 로드 ====================
 void CCanClientDlg::LoadHistoryFromFile()
 {
     CString filePath = _T("C:\\CanClient\\history.txt");
